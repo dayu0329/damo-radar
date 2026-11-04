@@ -23,7 +23,8 @@ from lavis.processors import *
 from lavis.runners import *
 from lavis.tasks import *
 
-torch.autograd.set_detect_anomaly(True)
+# torch.autograd.set_detect_anomaly(True)
+torch.autograd.set_detect_anomaly(False)
 
 
 def parse_args():

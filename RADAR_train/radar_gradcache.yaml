@@ -1,0 +1,33 @@
+model:
+  arch: radar_pretrain
+  load_pretrained: false
+  load_finetuned: false
+  med_config_path: ../ckpt/bert-base-uncased/config.json
+  max_txt_len: 512
+  queue_size: 0
+  alpha: 0.4
+  radar_plus: true
+  radar_ft: false
+
+data:
+  images: /data/dataset/merlin_root/resized_images
+  reports: /ssddata/CMMF/demo-radar/ckpt/merlin_report_organ_report_v1.json
+  abnormal: /ssddata/CMMF/demo-radar/ckpt/merlin_report_organ_normal_v1.json
+
+run:
+  batch_size_train: 3
+  contrastive_batch_size: 48
+  accum_grad_iters: 1
+  precision: bf16
+  init_lr: 5e-5
+  min_lr: 1e-6
+  warmup_lr: 1e-6
+  warmup_steps: 20
+  weight_decay: 0.05
+  max_epoch: 30
+  num_workers: 4
+  seed: 42
+  log_freq: 1
+  output_dir: /ssddata/CMMF/demo-radar/training_results/gradcache48
+  init_checkpoint: null
+  resume_ckpt_path: null

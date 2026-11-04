@@ -496,7 +496,7 @@ class RunnerBase:
                         dataset,
                         batch_size=bsz,
                         num_workers=num_workers,
-                        pin_memory=True,
+                        pin_memory=False,
                     )
                 )
             else:
@@ -519,7 +519,7 @@ class RunnerBase:
                     dataset,
                     batch_size=bsz,
                     num_workers=num_workers,
-                    pin_memory=True,
+                    pin_memory=False,
                     sampler=sampler,
                     shuffle=sampler is None and is_train,
                     collate_fn=collate_fn,

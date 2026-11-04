@@ -359,7 +359,8 @@ class DataFolder(Dataset):
     def __init__(self):
         super().__init__()
         
-        img_dir = '/Merlin/download/merlinabdominalctdataset/merlin_data'
+        # img_dir = '/Merlin/download/merlinabdominalctdataset/merlin_data'
+        img_dir = '/data/dataset/other_images'
         if not os.path.exists(img_dir):
             assert False, 'Please modify the img_dir to your own path.'
         

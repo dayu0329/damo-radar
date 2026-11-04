@@ -73,10 +73,13 @@ class CaptionDataset(BaseDataset, __DisplMixin):
         """
         super().__init__(vis_processor, text_processor, vis_root, ann_paths)
 
+        # self.annotation = json.load(open('../ckpt/merlin_report_organ_report_v1.json'))
+        # self.organ_abnormal_info = json.load(open('../ckpt/merlin_report_organ_normal_v1.json'))
+        
+        # vis_root = '../data/merlin_data_train_demo/resized_images'    # You can use full data here, '../data/merlin_data_train_full/resized_images'. Plase merging part00-02 to one folder.
         self.annotation = json.load(open('../ckpt/merlin_report_organ_report_v1.json'))
         self.organ_abnormal_info = json.load(open('../ckpt/merlin_report_organ_normal_v1.json'))
-        
-        vis_root = '../data/merlin_data_train_demo/resized_images'    # You can use full data here, '../data/merlin_data_train_full/resized_images'. Plase merging part00-02 to one folder.
+        vis_root = '/data/dataset/merlin_root/resized_images'
         self.patient_paths = [
             os.path.join(vis_root, folder)
             for folder in os.listdir(vis_root)
@@ -224,6 +227,8 @@ class CaptionDataset(BaseDataset, __DisplMixin):
                         organ_captions[organ] = f'normal.'
                 exit = True
             except Exception as e:
+                if getattr(self, "strict_loading", False):
+                    raise RuntimeError(f"Failed to load training case {self.patient_paths[index]}") from e
                 print(e)
                 index = random.randint(0, len(self.patient_paths) - 1)
                 continue
