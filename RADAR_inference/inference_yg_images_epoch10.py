@@ -4,15 +4,16 @@ import csv
 import gc
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
-import pandas as pd
 import torch
 from torch import nn
 import torch.nn.functional as functional
@@ -132,6 +133,8 @@ class MerlinDataFolder(torch.utils.data.Dataset):
     def __getitem__(self, index):
         image_path = self.img_paths[index]
         loaded = transforms.LoadImaged(keys=["image"], image_only=False, ensure_channel_first=True)({"image": image_path})
+        if loaded["image"].ndim != 4 or loaded["image"].shape[0] != 1:
+            raise ValueError(f"Expected a single-channel 3D CT: {image_path}")
         affine = loaded["image_meta_dict"]["affine"]
         spacing = [abs(affine[axis, axis].item()) for axis in range(3)]
         height, width, depth = loaded["image"].shape[1:]
@@ -178,7 +181,7 @@ def load_dataset(image_dir, prompt_source=DEFAULT_MERLIN_SOURCE, report_json=Non
 
 
 @torch.inference_mode()
-def infer_case(model, image, items, metadata, text_features, pad, device):
+def infer_case(model, image, items, metadata, text_features, pad, device, sw_batch_size=1, segmentation_device="auto"):
     image = image.unsqueeze(0)
     image_size = list(image.shape[2:])
     roi_size = (96, 256, 384)
@@ -186,22 +189,43 @@ def infer_case(model, image, items, metadata, text_features, pad, device):
     windows = dense_patch_slices(image_size, roi_size, interval)
     organ_logits = {item: [] for item in items}
     organ_features = {}
-    full_mask = torch.zeros((1, 37, *image_size), dtype=torch.float32)
-    counts = torch.zeros((1, 1, *image_size), dtype=torch.float32)
-    for window_index, window in enumerate(windows):
-        selection = (slice(None), slice(None), *window)
-        patch = image[selection].to(device)
+    accumulation_device = torch.device("cpu")
+    mask_bytes = 37 * math.prod(image_size) * 4
+    if device.type == "cuda" and segmentation_device != "cpu":
+        free_memory, _ = torch.cuda.mem_get_info(device)
+        free_memory += max(0, torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device))
+        budget = min(free_memory // 4, max(0, free_memory - 8 * 1024**3))
+        if segmentation_device == "cuda" or mask_bytes <= budget:
+            accumulation_device = device
+    if segmentation_device == "cuda" and device.type != "cuda":
+        raise ValueError("CUDA segmentation accumulation requires a CUDA inference device")
+    try:
+        full_mask = torch.zeros((1, 37, *image_size), dtype=torch.float32, device=accumulation_device)
+    except torch.cuda.OutOfMemoryError:
+        if segmentation_device != "auto":
+            raise
+        accumulation_device = torch.device("cpu")
+        full_mask = torch.zeros((1, 37, *image_size), dtype=torch.float32)
+    print(f"  segmentation accumulation: {accumulation_device}, buffer GiB={mask_bytes / 1024**3:.2f}", flush=True)
+    for window_start in range(0, len(windows), sw_batch_size):
+        batch_windows = windows[window_start:window_start + sw_batch_size]
+        selections = [(slice(None), slice(None), *window) for window in batch_windows]
+        patch = torch.cat([image[selection] for selection in selections], dim=0).to(device)
         organ_logits, probabilities = model.forward_test_win(
             patch, None, organ_logits, metadata["test_organ_names"], text_features, organ_features, None,
         )
         probabilities = functional.interpolate(probabilities, size=patch.shape[2:], mode="trilinear")
-        full_mask[selection] += probabilities.float().cpu()
-        counts[selection] += 1
-        print(f"  window {window_index + 1}/{len(windows)}", flush=True)
-    segmentation = (full_mask / counts.clamp_min(1)).argmax(1).unsqueeze(0)
-    del full_mask, counts
+        probabilities = probabilities.to(device=accumulation_device, dtype=torch.float32)
+        for batch_index, selection in enumerate(selections):
+            full_mask[selection] += probabilities[batch_index:batch_index + 1]
+        print(f"  windows {window_start + 1}-{window_start + len(batch_windows)}/{len(windows)}", flush=True)
+        del patch, probabilities
+    segmentation = full_mask.argmax(1).to(dtype=torch.uint8).cpu().unsqueeze(0)
+    del full_mask
     missing_organs = sorted({item[0] for item, values in organ_logits.items() if not values})
     for organ in missing_organs:
+        if organ in organ_features:
+            continue
         organ_id = model.organs.index(organ)
         organ_mask = segmentation.eq(organ_id + 1)
         if not organ_mask.any():
@@ -236,6 +260,10 @@ def parse_args(defaults=None):
     parser.add_argument("--shard-index", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--num-shards", type=int, default=1, help=argparse.SUPPRESS)
     parser.add_argument("--cpu-threads", type=int, default=4)
+    parser.add_argument("--sw-batch-size", type=int, default=1, help="Sliding windows per GPU forward pass; increase with available GPU memory")
+    parser.add_argument("--segmentation-device", choices=("auto", "cpu", "cuda"), default="auto", help="Accumulate segmentation on GPU when memory permits; cpu restores host accumulation")
+    parser.add_argument("--workers-per-gpu", type=int, default=1, help="Independent case processes per selected GPU; requires --devices")
+    parser.add_argument("--no-prefetch", action="store_true", help="Disable overlapping next-image loading with inference")
     parser.add_argument("--limit", type=int, help="Optional maximum number of images")
     parser.add_argument("--check-only", action="store_true", help="Validate real checkpoint, text features and input headers on CPU")
     if defaults:
@@ -243,6 +271,15 @@ def parse_args(defaults=None):
     args = parser.parse_args()
     if args.cpu_threads < 1 or (args.limit is not None and args.limit < 1):
         parser.error("cpu-threads and limit must be positive")
+    if args.sw_batch_size < 1:
+        parser.error("sw-batch-size must be positive")
+    if args.workers_per_gpu < 1:
+        parser.error("workers-per-gpu must be positive")
+    if args.workers_per_gpu > 1 and args.devices is None:
+        parser.error("Use --devices 0 --workers-per-gpu 2 for two processes on one GPU")
+    if args.sw_batch_size > 1 and not args.no_prefetch:
+        print("Disabling threaded prefetch with batched windows: this runtime requires synchronous image loading for validated batched results.", flush=True)
+        args.no_prefetch = True
     if Path(args.save_tag).name != args.save_tag or args.save_tag in ("", ".", ".."):
         parser.error("save-tag must be a filename tag")
     if args.num_shards < 1 or not 0 <= args.shard_index < args.num_shards:
@@ -314,7 +351,7 @@ def merge_shards(shard_outputs, expected_paths, output, devices):
 
 
 def run_workers(args, selected_paths):
-    devices = args.devices[:len(selected_paths)]
+    devices = (args.devices * args.workers_per_gpu)[:len(selected_paths)]
     if not args.check_only:
         available = torch.cuda.device_count()
         if any(device >= available for device in devices):
@@ -336,6 +373,8 @@ def run_workers(args, selected_paths):
                 "--img-dir", str(args.img_dir.resolve()), "--save-dir", str(worker_dir.resolve()),
                 "--save-tag", tag, "--device", f"cuda:{device_index}",
                 "--cpu-threads", str(args.cpu_threads), "--num-shards", str(len(devices)),
+                "--sw-batch-size", str(args.sw_batch_size),
+                "--segmentation-device", args.segmentation_device,
                 "--shard-index", str(shard_index),
             ]
             if args.report_json:
@@ -344,6 +383,8 @@ def run_workers(args, selected_paths):
                 command.extend(["--limit", str(args.limit)])
             if args.check_only:
                 command.append("--check-only")
+            if args.no_prefetch:
+                command.append("--no-prefetch")
             log_path = worker_dir / f"{tag}.log"
             handle = log_path.open("w", encoding="utf-8")
             handles.append(handle)
@@ -409,16 +450,18 @@ def main(defaults=None):
         "selected_images": len(selected_paths),
         "shard_index": args.shard_index, "num_shards": args.num_shards,
         "device": args.device,
+        "sw_batch_size": args.sw_batch_size,
+        "segmentation_device": args.segmentation_device,
     })
     count = len(dataset)
-    for image_path in dataset.img_paths[:count]:
-        reader = demo.sitk.ImageFileReader()
-        reader.SetFileName(image_path)
-        reader.ReadImageInformation()
-        if reader.GetDimension() != 3:
-            raise ValueError(f"Expected a 3D CT: {image_path}")
-        print(f"Input: {Path(image_path).name}, shape={reader.GetSize()}, spacing={reader.GetSpacing()}", flush=True)
     if args.check_only:
+        for image_path in dataset.img_paths:
+            reader = demo.sitk.ImageFileReader()
+            reader.SetFileName(image_path)
+            reader.ReadImageInformation()
+            if reader.GetDimension() != 3:
+                raise ValueError(f"Expected a 3D CT: {image_path}")
+            print(f"Input: {Path(image_path).name}, shape={reader.GetSize()}, spacing={reader.GetSpacing()}", flush=True)
         print(f"Compatibility checks passed: {len(dataset)} selected images, {count} headers checked; no GPU allocated.", flush=True)
         return
     device = torch.device(args.device)
@@ -428,19 +471,31 @@ def main(defaults=None):
     args.save_dir.mkdir(parents=True, exist_ok=True)
     output = args.save_dir / f"RADAR_infer_results_{args.save_tag}.csv"
     columns = ["file_name", *["_".join(item) for item in dataset.test_items]]
-    rows = []
     statuses = {}
-    for image_index in range(count):
-        image, items, metadata = dataset[image_index]
-        print(f"Case {image_index + 1}/{count}: {metadata['file_name']}", flush=True)
-        row, unscored = infer_case(model, image, items, metadata, text_features, pad, device)
-        rows.append(row)
-        statuses[metadata["file_name"]] = {"unscored_organs": unscored}
-        pd.DataFrame(rows, columns=columns).to_csv(output, index=False, encoding="utf-8-sig")
-        output.with_suffix(".json").write_text(json.dumps({**summary, "text_embeddings": str(args.text_embeddings.resolve()), "processed_images": len(rows), "cases": statuses}, ensure_ascii=False, indent=2), encoding="utf-8")
-        del image
-        gc.collect()
-    print(f"Saved {len(rows)} cases to {output}", flush=True)
+    started = time.perf_counter()
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    with ThreadPoolExecutor(max_workers=1) as loader, output.open("w", encoding="utf-8-sig", newline="") as csv_handle, output.with_suffix(".cases.jsonl").open("w", encoding="utf-8") as journal:
+        writer = csv.writer(csv_handle)
+        writer.writerow(columns)
+        future = loader.submit(dataset.__getitem__, 0) if count and not args.no_prefetch else None
+        for image_index in range(count):
+            case_started = time.perf_counter()
+            image, items, metadata = future.result() if future is not None else dataset[image_index]
+            future = loader.submit(dataset.__getitem__, image_index + 1) if image_index + 1 < count and not args.no_prefetch else None
+            print(f"Case {image_index + 1}/{count}: {metadata['file_name']}", flush=True)
+            row, unscored = infer_case(model, image, items, metadata, text_features, pad, device, args.sw_batch_size, args.segmentation_device)
+            statuses[metadata["file_name"]] = {"unscored_organs": unscored}
+            writer.writerow(row)
+            csv_handle.flush()
+            journal.write(json.dumps({"file_name": metadata["file_name"], "unscored_organs": unscored}, ensure_ascii=False) + "\n")
+            journal.flush()
+            elapsed = time.perf_counter() - started
+            print(f"Case seconds={time.perf_counter() - case_started:.2f}, elapsed={elapsed:.2f}, ETA seconds={elapsed / (image_index + 1) * (count - image_index - 1):.2f}", flush=True)
+            del image
+    peak_memory = torch.cuda.max_memory_allocated(device) / 1024**3 if device.type == "cuda" else 0
+    output.with_suffix(".json").write_text(json.dumps({**summary, "text_embeddings": str(args.text_embeddings.resolve()), "processed_images": count, "cases": statuses}, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"Saved {count} cases to {output}; elapsed seconds={time.perf_counter() - started:.2f}; peak GPU allocated GiB={peak_memory:.2f}", flush=True)
     return output
 
 

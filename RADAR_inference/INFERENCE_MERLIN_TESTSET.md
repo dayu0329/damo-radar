@@ -38,6 +38,55 @@ Outputs under `results/merlin_testset`:
 - `RADAR_infer_results_epoch10_merlin_testset.csv` and `.json`.
 - `RADAR_infer_results_radar_plus_merlin_testset.csv` and `.json`.
 
+Segmentation probabilities are accumulated in FP32 on the inference GPU by
+default, followed by GPU argmax. Only the final single-channel uint8 labels are
+copied to the CPU for organ cropping. Window order and scoring are unchanged.
+`--segmentation-device auto` uses at most a quarter of available GPU memory
+(driver-free memory plus this worker's reusable PyTorch cache) for the full-volume
+buffer, while reserving at least 8 GiB for inference; larger
+scans fall back to CPU accumulation. GPU allocation failure also falls back to
+CPU. Logs identify the actual accumulation device and buffer size per case.
+Use `--segmentation-device cpu` to restore CPU accumulation or `cuda` to require
+GPU accumulation. Forced CUDA mode can run out of memory. This option is passed
+to every worker and also applies to the YG and official RADAR+ entry points.
+
+GPU sliding-window batching is available through `--sw-batch-size` (default 1):
+
+```bash
+python RADAR_inference/inference_merlin_testset_epoch10.py --device cuda:0 --sw-batch-size 2
+python RADAR_inference/inference_merlin_testset_epoch10.py --devices 0,1,2,3 --sw-batch-size 2
+```
+
+This batches consecutive windows from one scan in one GPU forward pass, then
+scores them and stitches segmentation in original window order. Every GPU worker
+uses the requested batch size. It trades additional GPU memory for throughput;
+test a small number of cases first and lower it if memory is insufficient.
+GPU batching may cause floating-point differences, so it does not promise
+bitwise identical results. FP32, HU range, window dimensions and overlap are
+unchanged. Threaded prefetch is automatically disabled with window batches above
+one: the installed runtime produced invalid coverage when combining these paths.
+Synchronous batched loading was checked against batch=1 on real test cases.
+
+Independent case processes can also share one GPU:
+
+```bash
+python RADAR_inference/inference_merlin_testset_epoch10.py --devices 0 --workers-per-gpu 2 --sw-batch-size 1
+```
+
+The same option works with multiple devices and the official RADAR+ entry point.
+Each process loads a separate model and maintains its own prefetch thread and
+output shard. This requires substantially more GPU and CPU memory. It does not
+guarantee speedup when a single process already saturates the GPU; benchmark
+representative cases before a full run. Start with two processes and keep window
+batch size at one rather than multiplying both kinds of concurrency at once.
+
+One background thread preloads the next scan while the GPU computes the current
+scan. Use `--no-prefetch` if host memory is constrained. CSV rows and a
+`.cases.jsonl` journal are appended and flushed per case; the summary `.json`
+is written after successful completion. Logs report case time, estimated time
+remaining, total processing time and peak allocated GPU memory. Existing
+completed rows are not automatically resumed after interruption.
+
 Multi-GPU inference is supported by both entry points:
 
 ```bash
