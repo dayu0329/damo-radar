@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 
 import numpy as np
 import torch
@@ -21,6 +22,8 @@ from monai import transforms
 from monai.data.utils import dense_patch_slices
 from transformers import BertTokenizer
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import inference_demo as demo
 from dynamic_network_architectures.vision_branch import VisionBranch
 from generate_text_embeddings import merlin_prompts
@@ -29,6 +32,37 @@ from generate_text_embeddings import merlin_prompts
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CHECKPOINT = ROOT / "training_results/gradcache48/20261102_201102_310236/checkpoint_9.pth"
 DEFAULT_MERLIN_SOURCE = ROOT / "RADAR_train/infer_merlin_anatomy.py"
+
+
+def merlin_output_schema(items):
+    definitions = [
+        ("aorta_aortic-aneurysm", "主动脉_主动脉瘤", "abdominal_aortic_aneurysm"),
+        ("aorta_atherosclerosis", "主动脉_粥样硬化", "atherosclerosis"),
+        ("large bowel_submucosal-edema", "大肠_粘膜下水肿", "submucosal_edema"),
+        ("large bowel_appendicitis", "大肠_阑尾炎", "appendicitis"),
+        ("small bowel_bowel-obstruction", "小肠_梗阻", "bowel_obstruction"),
+        ("heart_aortic-valve-calcification", "心脏_主动脉瓣钙化", "aortic_valve_calcification"),
+        ("heart_cardiomegaly", "心脏_心影（脏）增大", "cardiomegaly"),
+        ("liver_biliary-ductal-dilation", "肝_肝内胆管扩张", "biliary_ductal_dilation"),
+        ("liver_hepatomegaly", "肝_肝大", "hepatomegaly"),
+        ("liver_hepatic-steatosis", "肝_脂肪肝", "hepatic_steatosis"),
+        ("lung_pleural-effusion", "肺_胸腔积液", "pleural_effusion"),
+        ("lung_atelectasis", "肺_膨胀不全", "atelectasis"),
+        ("kidney_renal-hypodensities", "肾_低密度影", "renal_hypodensities"),
+        ("kidney_renal-cyst", "肾_囊肿", "renal_cyst"),
+        ("kidney_hydronephrosis", "肾_肾积水", "hydronephrosis"),
+        ("gallbladder_gallstones", "胆囊_结石", "gallstones"),
+        ("pancreas_pancreatic-atrophy", "胰腺_萎缩", "pancreatic_atrophy"),
+        ("spleen_splenomegaly", "脾_脾大", "splenomegaly"),
+        ("lumbar vertebrae_fracture", "腰椎_骨折", "fracture"),
+        ("esophagus_hiatal-hernia", "食管_裂孔疝", "hiatal_hernia"),
+    ]
+    keys = ["_".join(item) for item in items]
+    if len(keys) != len(definitions) or set(keys) != {key for key, _, _ in definitions}:
+        raise ValueError("Inference items must match the official 20 MERLIN disease columns")
+    columns = ["file_name", *[f"{name}_({disease})" for _, name, disease in definitions]]
+    indices = [0, *[keys.index(key) + 1 for key, _, _ in definitions]]
+    return columns, indices
 
 
 def organ_mapping():
@@ -42,7 +76,40 @@ def organ_mapping():
 
 
 class CheckpointInference(nn.Module):
-    forward_test_win = demo.RADAR.forward_test_win
+    def forward_test_win(self, images, masks, organ_logits, test_organs, text_feat_dict,
+                         organ_feat_dict, whole_organ_sizes, skip_organ=None):
+        probabilities, segmentation, embeds1, embeds2, embeds3, flags1, flags2, flags3 = self.visual_encoder(images, None)
+        for batch_index, (embed1, embed2, embed3, mask) in enumerate(zip(embeds1, embeds2, embeds3, segmentation)):
+            boundaries = []
+            for axis in range(mask.dim()):
+                start = [slice(None)] * mask.dim()
+                end = [slice(None)] * mask.dim()
+                start[axis] = slice(None, 2)
+                end[axis] = slice(-2, None)
+                boundaries.extend((mask[tuple(start)].flatten(), mask[tuple(end)].flatten()))
+            present = torch.bincount(mask.flatten().long(), minlength=len(self.organs) + 1).gt(0)
+            boundary = torch.bincount(torch.cat(boundaries).long(), minlength=len(self.organs) + 1).gt(0)
+            if skip_organ is not None:
+                boundary[skip_organ + 1] = False
+            intact = (present & ~boundary)[1:].cpu().tolist()
+            for organ_id, is_intact in enumerate(intact):
+                organ_name = self.organs[organ_id]
+                if not is_intact or organ_name not in test_organs or organ_name in organ_feat_dict:
+                    continue
+                query = self.query_tokens[organ_id].unsqueeze(0).unsqueeze(0)
+                key = torch.cat([
+                    embed1[flags1[batch_index, organ_id]].unsqueeze(0),
+                    embed2[flags2[batch_index, organ_id]].unsqueeze(0),
+                    embed3[flags3[batch_index, organ_id]].unsqueeze(0),
+                ], dim=1)
+                updated_query, _ = self.attention(query, key, key)
+                image_feature = functional.normalize(self.vision_projs[organ_id](updated_query.squeeze(0)), dim=-1)
+                organ_feat_dict[organ_name] = image_feature
+                for item in organ_logits:
+                    if item[0] == organ_name:
+                        logits = image_feature @ text_feat_dict[item].t() / self.temp
+                        organ_logits[item].append(logits.softmax(-1))
+        return organ_logits, probabilities
 
     def __init__(self):
         super().__init__()
@@ -180,6 +247,51 @@ def load_dataset(image_dir, prompt_source=DEFAULT_MERLIN_SOURCE, report_json=Non
     return dataset
 
 
+def prepare_loader_worker(worker_id):
+    torch.set_num_threads(1)
+
+
+def single_case_batch(batch):
+    return batch[0]
+
+
+def iter_cases(dataset, args):
+    if args.no_prefetch:
+        for index in range(len(dataset)):
+            yield dataset[index]
+    elif args.loader_workers:
+        loader = torch.utils.data.DataLoader(
+            dataset, batch_size=1, shuffle=False, num_workers=args.loader_workers,
+            collate_fn=single_case_batch, worker_init_fn=prepare_loader_worker,
+            multiprocessing_context="spawn", prefetch_factor=args.prefetch_factor,
+        )
+        yield from loader
+    else:
+        with ThreadPoolExecutor(max_workers=1) as loader:
+            future = loader.submit(dataset.__getitem__, 0) if len(dataset) else None
+            for index in range(len(dataset)):
+                case = future.result()
+                future = loader.submit(dataset.__getitem__, index + 1) if index + 1 < len(dataset) else None
+                yield case
+
+
+def organ_crop_slices(mask, crop_size):
+    selections = []
+    for axis, requested in enumerate(crop_size):
+        occupied = mask.any(dim=tuple(other for other in range(3) if other != axis)).nonzero().flatten()
+        if not len(occupied):
+            return None
+        minimum, maximum = occupied[0].item(), occupied[-1].item()
+        extent = max(requested, maximum - minimum)
+        center = (minimum + maximum) // 2
+        start = max(0, center - extent // 2)
+        end = min(mask.shape[axis], start + extent)
+        if end - start < extent:
+            start = max(0, end - extent)
+        selections.append(slice(start, end))
+    return tuple(selections)
+
+
 @torch.inference_mode()
 def infer_case(model, image, items, metadata, text_features, pad, device, sw_batch_size=1, segmentation_device="auto"):
     image = image.unsqueeze(0)
@@ -228,15 +340,31 @@ def infer_case(model, image, items, metadata, text_features, pad, device, sw_bat
             continue
         organ_id = model.organs.index(organ)
         organ_mask = segmentation.eq(organ_id + 1)
-        if not organ_mask.any():
+        selections = organ_crop_slices(organ_mask[0, 0], roi_size)
+        if selections is None:
             continue
-        patch, patch_mask = demo.center_crop(image, organ_mask, roi_size)
+        patch = image[(slice(None), slice(None), *selections)]
+        patch_mask = organ_mask[(slice(None), slice(None), *selections)]
         padded = pad({"image": patch[0], "label": patch_mask[0].float()})
         organ_logits, _ = model.forward_test_win(
             padded["image"].unsqueeze(0).to(device), None, organ_logits,
             metadata["test_organ_names"], text_features, organ_features, None, skip_organ=organ_id,
         )
-    scores = [np.concatenate(organ_logits[item]).mean(0)[1].item() if organ_logits[item] else None for item in items]
+    scored_items = [item for item in items if organ_logits[item]]
+    if scored_items:
+        packed = torch.cat([
+            torch.cat(organ_logits[item]) for item in scored_items
+        ]).cpu().numpy().astype(np.float64)
+        offsets = np.cumsum([
+            0, *[sum(value.shape[0] for value in organ_logits[item]) for item in scored_items]
+        ])
+        means = {
+            item: packed[offsets[index]:offsets[index + 1]].mean(0)[1].item()
+            for index, item in enumerate(scored_items)
+        }
+    else:
+        means = {}
+    scores = [means.get(item) for item in items]
     unscored = {
         item[0]: "no_valid_organ_feature" if segmentation.eq(model.organs.index(item[0]) + 1).any() else "organ_not_detected_or_outside_scan"
         for item, values in organ_logits.items() if not values
@@ -247,6 +375,7 @@ def infer_case(model, image, items, metadata, text_features, pad, device, sw_bat
 def parse_args(defaults=None):
     parser = argparse.ArgumentParser(description="Checkpoint-matched MERLIN disease inference on YG NIfTI images")
     parser.add_argument("--checkpoint", type=Path, default=Path(os.environ.get("CHECKPOINT_PATH", str(DEFAULT_CHECKPOINT))))
+    parser.add_argument("--expected-checkpoint-epoch", type=int, help="Require this zero-based epoch in the checkpoint metadata")
     parser.add_argument("--text-embeddings", type=Path, default=Path(os.environ.get("TEXT_EMBEDDING_PATH", str(ROOT / "ckpt/infer_text_embedding_epoch10_merlin_anatomy.pt"))))
     parser.add_argument("--bert-dir", type=Path, default=ROOT / "ckpt/bert-base-uncased")
     parser.add_argument("--merlin-source", type=Path, default=DEFAULT_MERLIN_SOURCE)
@@ -264,6 +393,8 @@ def parse_args(defaults=None):
     parser.add_argument("--segmentation-device", choices=("auto", "cpu", "cuda"), default="auto", help="Accumulate segmentation on GPU when memory permits; cpu restores host accumulation")
     parser.add_argument("--workers-per-gpu", type=int, default=1, help="Independent case processes per selected GPU; requires --devices")
     parser.add_argument("--no-prefetch", action="store_true", help="Disable overlapping next-image loading with inference")
+    parser.add_argument("--loader-workers", type=int, default=2, help="CPU preprocessing processes per inference process; 0 uses legacy threaded prefetch")
+    parser.add_argument("--prefetch-factor", type=int, default=2, help="Prepared cases queued per CPU preprocessing process")
     parser.add_argument("--limit", type=int, help="Optional maximum number of images")
     parser.add_argument("--check-only", action="store_true", help="Validate real checkpoint, text features and input headers on CPU")
     if defaults:
@@ -277,8 +408,10 @@ def parse_args(defaults=None):
         parser.error("workers-per-gpu must be positive")
     if args.workers_per_gpu > 1 and args.devices is None:
         parser.error("Use --devices 0 --workers-per-gpu 2 for two processes on one GPU")
+    if args.loader_workers < 0 or args.prefetch_factor < 1:
+        parser.error("loader-workers must be nonnegative and prefetch-factor must be positive")
     if args.sw_batch_size > 1 and not args.no_prefetch:
-        print("Disabling threaded prefetch with batched windows: this runtime requires synchronous image loading for validated batched results.", flush=True)
+        print("Disabling background prefetch with batched windows: only synchronous batched loading has been validated in this runtime.", flush=True)
         args.no_prefetch = True
     if Path(args.save_tag).name != args.save_tag or args.save_tag in ("", ".", ".."):
         parser.error("save-tag must be a filename tag")
@@ -375,10 +508,14 @@ def run_workers(args, selected_paths):
                 "--cpu-threads", str(args.cpu_threads), "--num-shards", str(len(devices)),
                 "--sw-batch-size", str(args.sw_batch_size),
                 "--segmentation-device", args.segmentation_device,
+                "--loader-workers", str(args.loader_workers),
+                "--prefetch-factor", str(args.prefetch_factor),
                 "--shard-index", str(shard_index),
             ]
             if args.report_json:
                 command.extend(["--report-json", str(args.report_json.resolve())])
+            if args.expected_checkpoint_epoch is not None:
+                command.extend(["--expected-checkpoint-epoch", str(args.expected_checkpoint_epoch)])
             if args.limit is not None:
                 command.extend(["--limit", str(args.limit)])
             if args.check_only:
@@ -429,7 +566,10 @@ def main(defaults=None):
     args = parse_args(defaults)
     torch.set_num_threads(args.cpu_threads)
     dataset = load_dataset(args.img_dir, args.merlin_source, args.report_json)
+    columns, output_indices = merlin_output_schema(dataset.test_items)
     model, summary = load_model(args.checkpoint, args.bert_dir)
+    if args.expected_checkpoint_epoch is not None and summary["checkpoint_epoch_zero_based"] != args.expected_checkpoint_epoch:
+        raise ValueError(f"Expected zero-based checkpoint epoch {args.expected_checkpoint_epoch}, got {summary['checkpoint_epoch_zero_based']}")
     if set(dataset.test_organs) - set(model.organs):
         raise ValueError("MERLIN prompt regions do not match the training organ mapping")
     text_features = load_text_features(args, dataset.test_items, summary)
@@ -451,7 +591,10 @@ def main(defaults=None):
         "shard_index": args.shard_index, "num_shards": args.num_shards,
         "device": args.device,
         "sw_batch_size": args.sw_batch_size,
+        "csv_columns": columns,
         "segmentation_device": args.segmentation_device,
+        "loader_workers": 0 if args.no_prefetch else args.loader_workers,
+        "prefetch_factor": args.prefetch_factor,
     })
     count = len(dataset)
     if args.check_only:
@@ -470,29 +613,38 @@ def main(defaults=None):
     pad = transforms.DivisiblePadd(keys=["image", "label"], k=32, mode="constant", constant_values=0, method="end")
     args.save_dir.mkdir(parents=True, exist_ok=True)
     output = args.save_dir / f"RADAR_infer_results_{args.save_tag}.csv"
-    columns = ["file_name", *["_".join(item) for item in dataset.test_items]]
     statuses = {}
     started = time.perf_counter()
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
-    with ThreadPoolExecutor(max_workers=1) as loader, output.open("w", encoding="utf-8-sig", newline="") as csv_handle, output.with_suffix(".cases.jsonl").open("w", encoding="utf-8") as journal:
+    total_data_wait = 0.0
+    total_inference = 0.0
+    cases = iter_cases(dataset, args)
+    with closing(cases), output.open("w", encoding="utf-8-sig", newline="") as csv_handle, output.with_suffix(".cases.jsonl").open("w", encoding="utf-8") as journal:
         writer = csv.writer(csv_handle)
         writer.writerow(columns)
-        future = loader.submit(dataset.__getitem__, 0) if count and not args.no_prefetch else None
         for image_index in range(count):
             case_started = time.perf_counter()
-            image, items, metadata = future.result() if future is not None else dataset[image_index]
-            future = loader.submit(dataset.__getitem__, image_index + 1) if image_index + 1 < count and not args.no_prefetch else None
+            image, items, metadata = next(cases)
+            data_wait = time.perf_counter() - case_started
+            inference_started = time.perf_counter()
             print(f"Case {image_index + 1}/{count}: {metadata['file_name']}", flush=True)
             row, unscored = infer_case(model, image, items, metadata, text_features, pad, device, args.sw_batch_size, args.segmentation_device)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            inference_seconds = time.perf_counter() - inference_started
+            total_data_wait += data_wait
+            total_inference += inference_seconds
+            print(f"  data wait seconds={data_wait:.2f}, inference seconds={inference_seconds:.2f}", flush=True)
             statuses[metadata["file_name"]] = {"unscored_organs": unscored}
-            writer.writerow(row)
+            writer.writerow([row[index] for index in output_indices])
             csv_handle.flush()
             journal.write(json.dumps({"file_name": metadata["file_name"], "unscored_organs": unscored}, ensure_ascii=False) + "\n")
             journal.flush()
             elapsed = time.perf_counter() - started
             print(f"Case seconds={time.perf_counter() - case_started:.2f}, elapsed={elapsed:.2f}, ETA seconds={elapsed / (image_index + 1) * (count - image_index - 1):.2f}", flush=True)
             del image
+    print(f"Pipeline totals: data wait seconds={total_data_wait:.2f}, inference seconds={total_inference:.2f}", flush=True)
     peak_memory = torch.cuda.max_memory_allocated(device) / 1024**3 if device.type == "cuda" else 0
     output.with_suffix(".json").write_text(json.dumps({**summary, "text_embeddings": str(args.text_embeddings.resolve()), "processed_images": count, "cases": statuses}, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Saved {count} cases to {output}; elapsed seconds={time.perf_counter() - started:.2f}; peak GPU allocated GiB={peak_memory:.2f}", flush=True)

@@ -1,0 +1,30 @@
+{
+  "_comment": "逐疾病阈值模板。JSON 不支持 // 注释，所有以下划线开头的说明字段仅作为元数据保存，不参与计算。",
+  "_usage": "复制本文件为 merlin_thresholds.validation.json，将 null 替换为在独立验证集上确定的数值。null 表示未配置，不会默认使用 0.5。常规疾病使用 score >= threshold 判阳性。",
+  "_example": "填写格式示例：将某一项改为 0.37；此数值仅说明格式，不是推荐阈值。切勿在测试集上选择阈值后再当作独立测试结果。",
+  "_gallbladder": "胆囊缺失必须保留 null；该项采用原始分割值 < --gallbladder-cutoff，默认 1000，不是概率阈值。",
+  "_source": "待填写：验证集名称、版本、阈值选择规则、日期。",
+  "thresholds": {
+    "abdominal_aortic_aneurysm": 0.7,
+    "atherosclerosis": 0.7,
+    "submucosal_edema": 0.7,
+    "appendicitis": 0.7,
+    "bowel_obstruction": 0.7,
+    "aortic_valve_calcification": 0.7,
+    "cardiomegaly": 0.7,
+    "biliary_ductal_dilation": 0.7,
+    "hepatomegaly": 0.7,
+    "hepatic_steatosis": 0.7,
+    "pleural_effusion": 0.7,
+    "atelectasis": 0.7,
+    "renal_hypodensities": 0.7,
+    "renal_cyst": 0.7,
+    "hydronephrosis": 0.7,
+    "gallstones": 0.7,
+    "pancreatic_atrophy": 0.7,
+    "splenomegaly": 0.7,
+    "fracture": 0.7,
+    "hiatal_hernia": 0.7,
+    "surgically_absent_gallbladder": null
+  }
+}
