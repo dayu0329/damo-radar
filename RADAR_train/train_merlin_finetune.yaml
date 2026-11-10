@@ -1,0 +1,152 @@
+# Merlin epoch29 微调配置：使用预训练 checkpoint 初始化，在 Merlin 训练集上低学习率继续训练。
+# 相关配置：run.init_checkpoint 指向 epoch29 权重；run.resume_ckpt_path 必须保持为 null；run.output_dir 使用独立目录。
+# RADAR GradCache 预训练配置
+# 配置关系说明：
+# 1. data.images 和 data.masks 共同由 data.dataset_root 派生，必须包含同名 .nii.gz 文件。
+# 2. model.med_config_path 和 model.tokenizer_path 均由 model.text_encoder_path 派生。
+# 3. run.contrastive_batch_size 必须能被 run.batch_size_train * WORLD_SIZE 整除。
+# 4. run.branch_schedule 控制 global/organ 分支的循环比例；radar_plus=false 时固定使用 organ。
+# 5. run.output_dir 由 run.output_root 和 run.contrastive_batch_size 派生。
+
+model:
+  # 模型注册名称；训练入口使用 RadarPretrain.from_config 加载。
+  arch: radar_pretrain
+  # 是否使用通用 LAVIS 预训练/微调加载逻辑；当前入口使用显式 checkpoint，保持关闭。
+  load_pretrained: false
+  load_finetuned: false
+
+  # 文本编码器目录；目录中应包含 config.json、模型权重和 tokenizer 文件。
+  text_encoder_path: /ssddata/CMMF/demo-radar/ckpt/bert-base-uncased
+  # tokenizer 与文本编码器必须来自同一目录，避免词表不一致。
+  tokenizer_path: ${model.text_encoder_path}
+  # BERT 配置文件由文本编码器目录派生。
+  med_config_path: ${model.text_encoder_path}/config.json
+
+  # 视觉分支 UNet 权重；设为 null 可跳过 UNet 权重加载。
+  vision_checkpoint: /ssddata/CMMF/demo-radar/ckpt/checkpoint_unet.pth
+  # 图文投影后的共同嵌入维度。
+  embed_dim: 256
+  # 动量教师模型的更新系数，越接近 1 更新越平滑。
+  momentum: 0.995
+  # 当前 GradCache 训练不使用队列，但保留模型接口参数。
+  queue_size: 0
+  # 模型原有的动量蒸馏混合系数；当前 GradCache 路径不直接使用。
+  alpha: 0.4
+  # true 时按 branch_schedule 运行 global/organ；false 时只运行 organ。
+  radar_plus: true
+  # 是否从已有 RADAR checkpoint 初始化视觉分支。
+  radar_ft: false
+
+  # 可学习对比温度的初值和安全范围。
+  temperature_init: 0.07
+  temperature_min: 0.001
+  temperature_max: 0.5
+  # 两个视觉 attention 模块的结构参数。
+  attention_heads: 4
+  attention_dropout: 0.1
+
+# 数据文件布局。images 与 masks 按文件名一一对应。
+data:
+  # 数据集根目录；下面两个目录由此派生。
+  dataset_root: /data/dataset/merlin_root
+  images: ${data.dataset_root}/resized_images
+  masks: ${data.dataset_root}/resized_masks
+  # 标注文件根目录；报告和异常标注必须使用相同病例 ID。
+  annotation_root: /ssddata/CMMF/demo-radar/ckpt
+  reports: ${data.annotation_root}/merlin_report_organ_report_v1.json
+  abnormal: ${data.annotation_root}/merlin_report_organ_normal_v1.json
+
+# 数据读取和在线增强参数。
+preprocess:
+  # MONAI padding 和中心裁剪尺寸，顺序为 depth、height、width。
+  spatial_size: [96, 256, 384]
+  # CT 强度截断范围，截断后再归一化到 [0, 1]。
+  intensity_clip: [-1000, 1000]
+  # 三个空间轴的随机翻转概率，顺序对应 axis 0、1、2。
+  flip_prob: [0.2, 0.2, 0.2]
+
+# GradCache 实际优化目标的权重。
+loss:
+  # global/organ 图文对比损失权重。
+  itc_weight: 1.0
+  # 分割 Dice 损失权重。
+  seg_weight: 1.0
+
+run:
+  # 每个 DataLoader micro-batch 的病例数。
+  batch_size_train: 3
+  # 一次对比学习更新涉及的全局病例数；必须被 batch_size_train*WORLD_SIZE 整除。
+  contrastive_batch_size: 48
+  # GradCache 每个对比 batch 只允许一次更新，因此必须为 1。
+  accum_grad_iters: 1
+  # 支持 bf16、fp16、fp32；bf16/fp16 需要 CUDA 支持。
+  precision: bf16
+  # organ 文本按本次编码批次的最长长度补齐，减少无效 padding；global 完整报告仍保持原方式。
+  # 关联 model.max_txt_len（默认 512）：仅改变补齐长度，不降低长文本截断上限。
+  # 必须与下面 organ_text_batch_size 配合考虑；单独动态补齐短测未观察到加速。
+  # 学生、动量教师和梯度重放共用同一份 tokens；形状改变会改变 dropout 随机数对应关系。
+  organ_text_dynamic_padding: true
+  # 每卡 organ 文本编码/重放的最大文本条数；跨器官合批编码后按原位置拆回。
+  # 关联上面的动态补齐开关；不合并器官损失，不改变 batch_size_train 或 contrastive_batch_size。
+  # 增大会减少 BERT 调用，但可能增加最长补齐长度及文本重放显存；与 precision、GPU 显存相关。
+  # epoch29 双卡微调短测：16/32/64 的四步耗时为 111.87/104.31/104.82 秒，采用 32。
+  # 固定 512 原分块对照为 141.92 秒；两组均开启重放校验。未实测预训练完整 epoch 的收益。
+  # 每块保存随机状态，按相同 tokens 和分块重放；器官目标定义不变，不保证与旧轨迹逐位相同。
+  # 回退原路径：本项设为 0，同时将 organ_text_dynamic_padding 设为 false。
+  # 详细短测记录：results/performance_tests/text_batching/summary.json。
+  organ_text_batch_size: 32
+
+  # 学习率策略：warmup 后按 epoch 使用余弦衰减。
+  init_lr: 1e-5
+  min_lr: 1e-6
+  warmup_lr: 1e-6
+  warmup_steps: 20
+  # AdamW 权重衰减和 beta 参数。
+  weight_decay: 0.05
+  beta1: 0.9
+  beta2: 0.999
+  adam_eps: 1.0e-8
+
+  # 训练轮数和 DataLoader worker 数。
+  max_epoch: 10
+  # 每张 GPU 的加载进程数；与 prefetch_factor 相乘为该卡预取的 micro-batch 数。
+  num_workers: 8
+  # 每进程预取数量；8×2=16 个 micro-batch，覆盖两次更新（每次每卡 8 个）。
+  # 与 batch_size_train、contrastive_batch_size、GPU 数有关；增加会占用更多 /dev/shm。
+  # num_workers=0 时此项不生效；下面结果对应双卡、每卡 batch_size_train=3。
+  # 128GiB shm 新容器短测：8×2/8×4/16×4/24×4 均正常完成 6 次更新。
+  # 排除前两步，后四步总耗时依次为 139.41/144.02/143.19/161.53 秒。
+  # 共享内存峰值依次为 10.13/16.88/30.38/43.88GiB；加大并发未提速，保留 8×2。
+  # 测试为已缓存数据的短测，随机增强及系统负载会影响耗时，不代表完整 epoch 吞吐。
+  # 8×4 及更大配置超过旧 16GiB 容器容量，应使用新 128GiB shm 容器。
+  # 详细记录：results/performance_tests/loader_shm128g/summary.json。
+  prefetch_factor: 2
+  pin_memory: false
+  # 所有 rank 使用同一个基础随机种子；不同 rank 会派生独立随机流。
+  seed: 42
+
+  # 日志和指标窗口设置。
+  log_freq: 1
+  metrics_window: 100
+
+  # 输出目录由根目录和全局对比 batch 大小派生。
+  output_root: /ssddata/CMMF/demo-radar/training_results
+  output_dir: ${run.output_root}/merlin_finetune_epoch29
+
+  # global、organ 按此序列循环；[global, organ, organ] 表示 1:2 比例。
+  branch_schedule: [global, organ]
+  # null 表示不限制梯度范数；设置正数后启用梯度裁剪。
+  max_grad_norm: null
+
+  # 每隔多少个 epoch 保存一次；最后一个 epoch 始终保存。
+  save_freq: 1
+  # 时区仅影响日志和输出时间戳。
+  timezone: Asia/Shanghai
+  # CUDA 与 autograd 调试选项。
+  cudnn_benchmark: false
+  cudnn_deterministic: true
+  detect_anomaly: false
+
+  # 初始化模型权重或恢复 GradCache checkpoint；二者同时设置时 resume 优先。
+  init_checkpoint: /ssddata/CMMF/demo-radar/training_results/gradcache48/20261102_201102_310236/checkpoint_29.pth
+  resume_ckpt_path: null

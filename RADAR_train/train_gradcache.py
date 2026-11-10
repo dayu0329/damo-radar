@@ -54,14 +54,15 @@ def learning_rate(config, epoch, step):
 
 def main():
     parser = argparse.ArgumentParser(description="RADAR distributed contrastive gradient cache")
-    parser.add_argument("--cfg-path", default="radar_gradcache.yaml")
+    parser.add_argument("--cfg-path", default=str(Path(__file__).with_name("train_gradcache.yaml")))
     parser.add_argument("--options", nargs="*", default=[])
     parser.add_argument("--max-steps", type=int, default=0)
     parser.add_argument("--verify-replay", action="store_true")
     args = parser.parse_args()
     config = OmegaConf.merge(OmegaConf.load(args.cfg_path), OmegaConf.from_dotlist(args.options))
-    os.environ["TZ"] = "Asia/Shanghai"
-    time.tzset()
+    os.environ["TZ"] = str(config.run.get("timezone", "Asia/Shanghai"))
+    if hasattr(time, "tzset"):
+        time.tzset()
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
     if int(os.environ.get("WORLD_SIZE", "1")) > 1:
@@ -82,9 +83,9 @@ def main():
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    torch.autograd.set_detect_anomaly(False)
+    torch.backends.cudnn.benchmark = bool(config.run.get("cudnn_benchmark", False))
+    torch.backends.cudnn.deterministic = bool(config.run.get("cudnn_deterministic", True))
+    torch.autograd.set_detect_anomaly(bool(config.run.get("detect_anomaly", False)))
     precision = config.run.precision
     if precision == "bf16" and not torch.cuda.is_bf16_supported():
         raise ValueError("BF16 is not supported by this GPU")
@@ -103,12 +104,16 @@ def main():
     if rank == 0:
         (output / "environment.json").write_text(json.dumps(environment, indent=2))
     logging.info("output=%s torch=%s cuda=%s GPU=%s", output, torch.__version__, torch.version.cuda, torch.cuda.get_device_name())
-    dataset = CaptionDataset(RadarImageTrainProcessor(), RadarReportProcessor(), "", [])
+    image_processor = RadarImageTrainProcessor.from_config(config.get("preprocess", {}))
+    dataset = CaptionDataset(
+        image_processor,
+        RadarReportProcessor(),
+        str(config.data.images),
+        [],
+        data_config=config.data,
+        preprocess_config=config.get("preprocess", {}),
+    )
     dataset.strict_loading = True
-    if config.get("data"):
-        dataset.annotation = json.loads(Path(config.data.reports).read_text())
-        dataset.organ_abnormal_info = json.loads(Path(config.data.abnormal).read_text())
-        dataset.patient_paths = sorted(str(path) for path in Path(config.data.images).glob("*.nii.gz"))
     if len(dataset) < contrastive_batch:
         raise ValueError(f"Need at least {contrastive_batch} training cases; found {len(dataset)}")
     if len(set(dataset.patient_paths)) != len(dataset.patient_paths):
@@ -117,7 +122,7 @@ def main():
         patient = Path(path).name.removesuffix(".nii.gz")
         if patient not in dataset.annotation or patient not in dataset.organ_abnormal_info:
             raise ValueError(f"Missing report/abnormal annotation: {patient}")
-        if not Path(path.replace("resized_images", "resized_masks")).is_file():
+        if not Path(dataset.mask_path_for(path)).is_file():
             raise ValueError(f"Missing mask: {path}")
     model = RadarPretrain.from_config(config.model).cuda().train()
     if world_size() > 1:
@@ -127,10 +132,13 @@ def main():
     optimizer = torch.optim.AdamW(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
         lr=float(config.run.init_lr), weight_decay=float(config.run.weight_decay),
-        betas=(0.9, float(config.run.get("beta2", 0.999))),
+        betas=(float(config.run.get("beta1", 0.9)), float(config.run.get("beta2", 0.999))),
+        eps=float(config.run.get("adam_eps", 1e-8)),
     )
     scaler = torch.amp.GradScaler("cuda", enabled=precision == "fp16")
-    cache = GradientCache(model, precision=precision, verify_replay=args.verify_replay)
+    cache = GradientCache(model, precision=precision, verify_replay=args.verify_replay, itc_weight=float(config.loss.get("itc_weight", 1.0)), seg_weight=float(config.loss.get("seg_weight", 1.0)),
+                          organ_text_dynamic_padding=bool(config.run.get("organ_text_dynamic_padding", False)),
+                          organ_text_batch_size=int(config.run.get("organ_text_batch_size", 0)))
     start_epoch, global_step = 0, 0
     resume = config.run.get("resume_ckpt_path")
     if resume:
@@ -169,7 +177,7 @@ def main():
     logging.info("cases=%d micro_batch=%d contrastive_batch=%d updates_per_epoch=%d remainder_dropped=%d",
                  len(dataset), micro_batch, contrastive_batch, updates_per_epoch, len(dataset) % contrastive_batch)
     logging.info("world_size=%d local_cases=%d microbatches_per_rank=%d", world_size(), local_cases, local_cases // micro_batch)
-    windows = defaultdict(lambda: deque(maxlen=100))
+    windows = defaultdict(lambda: deque(maxlen=int(config.run.get("metrics_window", 100))))
     skipped_updates = 0
     training_started = time.monotonic()
     journal_path = output / "metrics.jsonl" if rank == 0 else Path(os.devnull)
@@ -178,21 +186,35 @@ def main():
             generator = torch.Generator().manual_seed(seed + epoch)
             order = torch.randperm(len(dataset), generator=generator).tolist()
             indices = order[rank:updates_per_epoch * contrastive_batch:world_size()]
+            loader_workers = int(config.run.num_workers)
+            prefetch_factor = int(config.run.get("prefetch_factor", 2))
+            if loader_workers < 0 or prefetch_factor < 1:
+                raise ValueError("num_workers must be >= 0 and prefetch_factor >= 1")
+            # num_workers=0 时 PyTorch 不接受 prefetch_factor。
+            loader_options = {"prefetch_factor": prefetch_factor} if loader_workers else {}
             loader = DataLoader(
                 Subset(dataset, indices), batch_size=micro_batch, shuffle=False, generator=generator,
-                num_workers=int(config.run.num_workers), pin_memory=False, drop_last=True,
+                num_workers=loader_workers,
+                **loader_options,
+                pin_memory=bool(config.run.get("pin_memory", False)), drop_last=True,
             )
             iterator = iter(loader)
             epoch_losses = defaultdict(list)
             for update in range(updates_per_epoch):
                 started = time.monotonic()
                 samples = [next(iterator) for _ in range(local_cases // micro_batch)]
+                # 本卡取数等待；下方 rank_wait 包含病例 ID 汇总及等待其他卡。
+                data_wait_seconds = time.monotonic() - started
+                sync_started = time.monotonic()
                 ids = sum([list(sample["patient_id"]) for sample in samples], [])
                 ids = sum(gather_objects(ids), [])
                 if len(set(ids)) != contrastive_batch:
                     raise ValueError("A contrastive batch contains duplicate patients, possibly due to dataset retry logic")
+                rank_wait_seconds = time.monotonic() - sync_started
+                # 保留原 load_seconds 口径，便于与历史日志比较。
                 load_seconds = time.monotonic() - started
-                branch = "global" if global_step % 2 == 0 and model.radar_plus else "organ"
+                schedule = list(config.run.get("branch_schedule", ["global", "organ"]))
+                branch = schedule[global_step % len(schedule)] if model.radar_plus else "organ"
                 rate = learning_rate(config, epoch, global_step)
                 for group in optimizer.param_groups:
                     group["lr"] = rate
@@ -201,7 +223,10 @@ def main():
                 metrics = cache.backward(samples, branch, scaler)
                 synchronize_gradients(model)
                 scaler.unscale_(optimizer)
-                gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float("inf"))
+                max_grad_norm = config.run.get("max_grad_norm")
+                gradient_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), float("inf") if max_grad_norm is None else float(max_grad_norm)
+                )
                 scale_before = scaler.get_scale()
                 if not torch.isfinite(gradient_norm) and precision != "fp16":
                     raise FloatingPointError(f"Non-finite gradients at update {global_step}")
@@ -217,6 +242,8 @@ def main():
                     "lr": rate, "gradient_norm": gradient_norm.item() if torch.isfinite(gradient_norm) else None,
                     "amp_scale": scaler.get_scale(), "update_skipped": skipped,
                     "skipped_updates": skipped_updates, "load_seconds": load_seconds,
+                    "data_wait_seconds": data_wait_seconds,
+                    "rank_wait_seconds": rank_wait_seconds,
                     "step_seconds": time.monotonic() - started,
                     "allocated_mib": torch.cuda.memory_allocated() / 2**20,
                     "reserved_mib": torch.cuda.memory_reserved() / 2**20,
@@ -230,6 +257,9 @@ def main():
                     raise FloatingPointError(f"Non-finite loss at update {global_step}")
                 journal.write(json.dumps(metrics, ensure_ascii=False, allow_nan=False) + "\n")
                 if update % int(config.run.log_freq) == 0:
+                    logging.info("input epoch=%d update=%d rank=%d data_wait=%.3f rank_wait=%.3f workers=%d prefetch=%d",
+                                 epoch, update, rank, data_wait_seconds, rank_wait_seconds,
+                                 loader_workers, prefetch_factor if loader_workers else 0)
                     logging.info("epoch=%d update=%d/%d branch=%s cases=%d pairs=%d itc=%.5f mean100=%.5f seg=%.5f grad=%s lr=%.3g seconds=%.2f peak_MiB=%.0f skipped=%s",
                                  epoch, update, updates_per_epoch, branch, metrics["cases"], metrics["pairs"],
                                  metrics["loss_itc"], metrics["loss_itc_mean_100"], metrics["loss_seg"],
@@ -239,7 +269,8 @@ def main():
                     logging.info("Smoke test complete: %d updates, no production training started", global_step)
                     return
                 del samples
-            save_checkpoint(output / f"checkpoint_{epoch}.pth", model, optimizer, scaler, config, epoch, global_step)
+            if (epoch + 1) % int(config.run.get("save_freq", 1)) == 0 or epoch == int(config.run.max_epoch) - 1:
+                save_checkpoint(output / f"checkpoint_{epoch}.pth", model, optimizer, scaler, config, epoch, global_step)
             summary = {branch: sum(values) / len(values) for branch, values in epoch_losses.items()}
             logging.info("epoch=%d branch_mean_itc=%s elapsed_hours=%.3f checkpoint_saved=true", epoch, summary, (time.monotonic() - training_started) / 3600)
 

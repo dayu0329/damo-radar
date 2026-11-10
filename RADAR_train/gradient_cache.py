@@ -192,31 +192,86 @@ def encode_text(model, tokenized, teacher=False):
 
 
 class GradientCache:
-    def __init__(self, model, precision="bf16", verify_replay=False):
+    def __init__(self, model, precision="bf16", verify_replay=False, itc_weight=1.0, seg_weight=1.0, organ_text_dynamic_padding=False, organ_text_batch_size=0):
         self.model = model
         self.dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
         self.verify_replay = verify_replay
+        self.itc_weight = float(itc_weight)
+        self.seg_weight = float(seg_weight)
+        self.organ_text_dynamic_padding = bool(organ_text_dynamic_padding)
+        self.organ_text_batch_size = int(organ_text_batch_size)
+        if self.organ_text_batch_size < 0:
+            raise ValueError("organ_text_batch_size must be >= 0")
 
     def autocast(self):
         return torch.autocast("cuda", dtype=self.dtype, enabled=self.dtype != torch.float32)
 
-    def text_input(self, captions):
+    def text_input(self, captions, organ=False):
         return self.model.tokenizer(
-            captions, padding="max_length", truncation=True,
+            # 仅器官报告按本批最长文本补齐；截断上限仍由 model.max_txt_len 控制。
+            captions, padding="longest" if organ and self.organ_text_dynamic_padding else "max_length", truncation=True,
             max_length=self.model.max_txt_len, return_tensors="pt",
         ).to("cuda")
+
+    def cache_organ_text(self, groups):
+        # 编码时跨器官合批；随后按原顺序拆回 entry，器官损失分组保持不变。
+        entries = [entry for group in groups.values() for entry in group]
+        captions = [caption for entry in entries for caption in entry["captions"]]
+        chunks, student_parts, teacher_parts = [], [], []
+        token_slots = 0
+        for start in range(0, len(captions), self.organ_text_batch_size):
+            end = min(start + self.organ_text_batch_size, len(captions))
+            tokens = self.text_input(captions[start:end], organ=True)
+            state = RandomState.capture()
+            with self.autocast():
+                text = encode_text(self.model, tokens).float().detach()
+                teacher = encode_text(self.model, tokens, teacher=True).float().detach()
+            chunks.append({"tokens": tokens, "state": state, "text": text, "start": start, "end": end})
+            student_parts.append(text)
+            teacher_parts.append(teacher)
+            token_slots += tokens["input_ids"].numel()
+        if entries:
+            student = torch.cat(student_parts)
+            teacher = torch.cat(teacher_parts)
+            offset = 0
+            for entry in entries:
+                end = offset + len(entry["captions"])
+                entry["text"] = student[offset:end]
+                entry["teacher"] = teacher[offset:end]
+                offset = end
+        return chunks, token_slots, len(captions)
+
+    def replay_organ_text(self, groups, chunks, scaler):
+        entries = [entry for group in groups.values() for entry in group]
+        if not any("text_grad" in entry for entry in entries):
+            return
+        # 无有效对比损失的器官以零梯度占位，确保跨 entry 分块的索引仍然对齐。
+        gradient = torch.cat([entry["text_grad"] if "text_grad" in entry else torch.zeros_like(entry["text"])
+                              for entry in entries])
+        for chunk in chunks:
+            with chunk["state"].replay(), self.autocast():
+                text = encode_text(self.model, chunk["tokens"])
+                if self.verify_replay:
+                    torch.testing.assert_close(text.float(), chunk["text"], rtol=1e-3, atol=1e-4)
+                surrogate = (text.float() * gradient[chunk["start"]:chunk["end"]]).sum()
+            scaler.scale(surrogate).backward()
 
     def backward(self, samples, branch, scaler):
         model = self.model
         started = time.monotonic()
         visual_records = []
         groups = {}
+        text_token_slots = 0
+        text_sequences = 0
+        text_chunks = []
+        text_cache_batches = 0
+        batched_text = branch == "organ" and self.organ_text_batch_size > 0
         case_count = sum(len(sample["image"]) for sample in samples)
         if branch == "organ":
             model._momentum_update()
         logging.info("gradcache branch=%s phase=cache_visual microbatches=%d cases=%d", branch, len(samples), case_count)
         with torch.no_grad():
-            model.temp.clamp_(0.001, 0.5)
+            model.temp.clamp_(model.temperature_min, model.temperature_max)
             for sample in samples:
                 validate_sample(sample)
                 device_sample = {"image": sample["image"].cuda()}
@@ -237,19 +292,30 @@ class GradientCache:
                 visual_records.append((sample, state, buffers, entries))
                 del encoded, probabilities, device_sample
             logging.info("gradcache branch=%s phase=cache_text groups=%d", branch, len(groups))
-            for key, entries in groups.items():
-                for entry in entries:
-                    tokens = self.text_input(entry["captions"])
-                    entry["tokens"] = tokens
-                    entry["text_state"] = RandomState.capture()
-                    with self.autocast():
-                        entry["text"] = encode_text(model, tokens).float().detach()
-                        if key != "global":
-                            entry["teacher"] = encode_text(model, tokens, teacher=True).float().detach()
+            if batched_text:
+                text_chunks, text_token_slots, text_sequences = self.cache_organ_text(groups)
+                text_cache_batches = len(text_chunks)
+            else:
+                for key, entries in groups.items():
+                    for entry in entries:
+                        tokens = self.text_input(entry["captions"], organ=key != "global")
+                        text_token_slots += tokens["input_ids"].numel()
+                        text_sequences += len(entry["captions"])
+                        text_cache_batches += 1
+                        entry["tokens"] = tokens
+                        entry["text_state"] = RandomState.capture()
+                        with self.autocast():
+                            entry["text"] = encode_text(model, tokens).float().detach()
+                            if key != "global":
+                                entry["teacher"] = encode_text(model, tokens, teacher=True).float().detach()
         final_buffers = snapshot_buffers(model.visual_encoder)
         local_groups = groups
         groups = gather_groups(local_groups)
         metrics = {"branch": branch, "cases": case_count * world_size(), "organs": {}, "effective_organs": 0}
+        metrics["text_cache_batches"] = text_cache_batches
+        metrics["text_token_slots"] = text_token_slots
+        metrics["text_sequences"] = text_sequences
+        metrics["text_mean_padded_length"] = text_token_slots / max(text_sequences, 1)
         metrics["cache_seconds"] = time.monotonic() - started
         total_itc = model.temp * 0
         for key, entries in groups.items():
@@ -268,7 +334,7 @@ class GradientCache:
                 targets = organ_targets(teacher, abnormal, captions, model.temp)
                 if torch.unique(targets).numel() == 1:
                     continue
-            loss = symmetric_contrastive(image, text, model.temp, targets)
+            loss = self.itc_weight * symmetric_contrastive(image, text, model.temp, targets)
             gradients = torch.autograd.grad(loss, (image, text, model.temp))
             total_itc = total_itc + gradients[2].detach() * model.temp / world_size()
             offset = 0
@@ -291,16 +357,19 @@ class GradientCache:
         logging.info("gradcache branch=%s phase=replay_text effective_organs=%d", branch, metrics["effective_organs"])
         scaler.scale(total_itc).backward()
         del total_itc
-        for entries in local_groups.values():
-            for entry in entries:
-                if "text_grad" not in entry:
-                    continue
-                with entry["text_state"].replay(), self.autocast():
-                    text = encode_text(model, entry["tokens"])
-                    if self.verify_replay:
-                        torch.testing.assert_close(text.float(), entry["text"], rtol=1e-3, atol=1e-4)
-                    surrogate = (text.float() * entry["text_grad"]).sum()
-                scaler.scale(surrogate).backward()
+        if batched_text:
+            self.replay_organ_text(local_groups, text_chunks, scaler)
+        else:
+            for entries in local_groups.values():
+                for entry in entries:
+                    if "text_grad" not in entry:
+                        continue
+                    with entry["text_state"].replay(), self.autocast():
+                        text = encode_text(model, entry["tokens"])
+                        if self.verify_replay:
+                            torch.testing.assert_close(text.float(), entry["text"], rtol=1e-3, atol=1e-4)
+                        surrogate = (text.float() * entry["text_grad"]).sum()
+                    scaler.scale(surrogate).backward()
         segmentation_loss = 0.0
         logging.info("gradcache branch=%s phase=replay_visual", branch)
         try:
@@ -310,7 +379,7 @@ class GradientCache:
                 with state.replay(), self.autocast():
                     encoded, probabilities = encode_visual(model, device_sample, branch)
                     target = functional.interpolate(sample["seg"].cuda().unsqueeze(1), size=probabilities.shape[-3:], mode="nearest")
-                    loss_seg = model.dice_loss(probabilities.float(), target)
+                    loss_seg = self.seg_weight * model.dice_loss(probabilities.float(), target)
                     surrogate = loss_seg * (len(sample["image"]) / (case_count * world_size()))
                     segmentation_loss += surrogate.detach().item()
                     for key, (image, _) in encoded.items():

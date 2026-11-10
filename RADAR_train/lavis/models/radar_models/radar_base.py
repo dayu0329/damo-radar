@@ -22,8 +22,8 @@ class RadarBase(BaseModel):
         transformers_version = version.parse(transformers.__version__)
         
     @classmethod
-    def init_tokenizer(cls):
-        tokenizer = BertTokenizer.from_pretrained("../ckpt/bert-base-uncased")
+    def init_tokenizer(cls, tokenizer_path="../ckpt/bert-base-uncased"):
+        tokenizer = BertTokenizer.from_pretrained(tokenizer_path)
         return tokenizer
 
     def load_from_pretrained(self, url_or_filename):

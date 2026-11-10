@@ -1,0 +1,73 @@
+# Merlin 格式推理配置。通过 --model-profile 和 --dataset-profile 组合选择实验。
+# 自有数据集只需使用相同 NIfTI 格式，并修改 datasets 下的 image_dir；report_json 可设为 null。
+model_profile: epoch29
+dataset_profile: merlin_testset
+
+paths:
+  # 文本编码器目录与生成文本 embedding 时使用的 tokenizer 必须一致。
+  text_encoder_path: /ssddata/CMMF/demo-radar/ckpt/bert-base-uncased
+  merlin_prompt_source: /ssddata/CMMF/demo-radar/RADAR_train/infer_merlin_anatomy.py
+
+# 每个模型的 checkpoint 必须配套使用对应的 text_embeddings。
+models:
+  epoch10:
+    checkpoint: /ssddata/CMMF/demo-radar/training_results/gradcache48/20261102_201102_310236/checkpoint_9.pth
+    expected_checkpoint_epoch: 9
+    text_embeddings: /ssddata/CMMF/demo-radar/ckpt/infer_text_embedding_epoch10_merlin_anatomy.pt
+  epoch29:
+    checkpoint: /ssddata/CMMF/demo-radar/training_results/gradcache48/20261102_201102_310236/checkpoint_29.pth
+    expected_checkpoint_epoch: 29
+    text_embeddings: /ssddata/CMMF/demo-radar/ckpt/infer_text_embedding_epoch29_merlin_anatomy.pt
+  radar_plus:
+    checkpoint: /ssddata/CMMF/demo-radar/ckpt/checkpoint_radar_plus.pth
+    expected_checkpoint_epoch: null
+    text_embeddings: /ssddata/CMMF/demo-radar/ckpt/infer_text_embedding_radar_plus_merlin_anatomy.pt
+
+# report_json 为 null 时，读取 image_dir 中全部 .nii / .nii.gz 文件。
+# 提供报告 JSON 时，只读取其中 split=test 的病例。
+datasets:
+  merlin_testset:
+    image_dir: /data/dataset/other_images
+    report_json: /data/dataset/json/merlin_report.json
+    save_dir: /ssddata/CMMF/demo-radar/results/merlin_testset
+    save_suffix: merlin_testset
+  yg_images:
+    image_dir: /data/dataset/yg_images
+    report_json: null
+    save_dir: /ssddata/CMMF/demo-radar/results/yg_images
+    save_suffix: merlin
+
+# 与训练和文本 embedding 生成过程保持一致。
+model:
+  bert_dir: ${paths.text_encoder_path}
+  vision_width: 256
+  embed_dim: 256
+  attention_heads: 4
+  attention_dropout: 0.1
+  segmentation_classes: 37
+text:
+  prompt_source: merlin
+  aggregation: mean
+  max_length: 100
+  generation_batch_size: 16
+
+preprocess:
+  spatial_size: [96, 256, 384]
+  intensity_clip: [-1000, 1000]
+  reference_spacing: [1.0, 1.0, 5.0]
+  crop_margins: [5, 20, 20]
+
+inference:
+  roi_size: ${preprocess.spatial_size}
+  sliding_window_overlap: 0.25
+  sliding_window_batch_size: 1
+  segmentation_device: auto
+  cpu_threads: 4
+  loader_workers: 4
+  prefetch_factor: 2
+  workers_per_gpu: 3
+  # 单卡写 cuda:2；多卡可写 cuda:2,3，入口会为每张卡启动一个进程。
+  device: cuda:2,3
+  # null 表示处理数据集中全部病例；测试可用 --limit 1 覆盖。
+  limit: null
+  no_prefetch: false

@@ -73,11 +73,14 @@ class RadarPretrain(RadarBase, SharedQueueMixin, MomentumDistilationMixin):
         momentum=0.995,
         tie_enc_dec_weights=False,
         max_txt_len=512,
-        radar_plus=True
+        radar_plus=True,
+        tokenizer_path="../ckpt/bert-base-uncased",
+        temperature_init=0.07, temperature_min=0.001, temperature_max=0.5,
+        attention_heads=4, attention_dropout=0.1
     ):
         super().__init__()
 
-        self.tokenizer = self.init_tokenizer()
+        self.tokenizer = self.init_tokenizer(tokenizer_path)
         text_encoder.resize_token_embeddings(len(self.tokenizer))
         self.text_encoder = text_encoder
 
@@ -91,7 +94,9 @@ class RadarPretrain(RadarBase, SharedQueueMixin, MomentumDistilationMixin):
 
         self.queue_size = queue_size
         self.momentum = momentum
-        self.temp = nn.Parameter(0.07 * torch.ones([]))
+        self.temp = nn.Parameter(temperature_init * torch.ones([]))
+        self.temperature_min = temperature_min
+        self.temperature_max = temperature_max
 
         self.alpha = alpha
         self.max_txt_len = max_txt_len
@@ -147,8 +152,8 @@ class RadarPretrain(RadarBase, SharedQueueMixin, MomentumDistilationMixin):
         
         self.attention = nn.MultiheadAttention(
             embed_dim=vision_width,
-            num_heads=4,
-            dropout=0.1,
+            num_heads=attention_heads,
+            dropout=attention_dropout,
             batch_first=True
         )
 
@@ -161,8 +166,8 @@ class RadarPretrain(RadarBase, SharedQueueMixin, MomentumDistilationMixin):
         self.vision_projs_whole = nn.Linear(vision_width, embed_dim)
         self.attention_whole = nn.MultiheadAttention(
             embed_dim=vision_width,
-            num_heads=4,
-            dropout=0.1,
+            num_heads=attention_heads,
+            dropout=attention_dropout,
             batch_first=True
         )
         self.query_tokens_whole = nn.Parameter(torch.zeros(1, vision_width))
@@ -442,7 +447,7 @@ class RadarPretrain(RadarBase, SharedQueueMixin, MomentumDistilationMixin):
     @classmethod
     def from_config(cls, cfg=None):
 
-        image_encoder = VisionBranch()
+        image_encoder = VisionBranch(checkpoint_path=cfg.get("vision_checkpoint", "../ckpt/checkpoint_unet.pth"))
         text_encoder = XBertEncoder.from_config(cfg, from_pretrained=True)
         text_decoder = None
 
@@ -453,6 +458,12 @@ class RadarPretrain(RadarBase, SharedQueueMixin, MomentumDistilationMixin):
         queue_size = cfg.get("queue_size", 57600)
         radar_plus = cfg.get("radar_plus", True)
         radar_ft = cfg.get("radar_ft", True)
+        tokenizer_path = cfg.get("tokenizer_path", "../ckpt/bert-base-uncased")
+        temperature_init = cfg.get("temperature_init", 0.07)
+        temperature_min = cfg.get("temperature_min", 0.001)
+        temperature_max = cfg.get("temperature_max", 0.5)
+        attention_heads = cfg.get("attention_heads", 4)
+        attention_dropout = cfg.get("attention_dropout", 0.1)
 
         model = cls(
             image_encoder=image_encoder,
@@ -463,8 +474,10 @@ class RadarPretrain(RadarBase, SharedQueueMixin, MomentumDistilationMixin):
             momentum=momentum,
             alpha=alpha,
             tie_enc_dec_weights=False,
-            max_txt_len=max_txt_len,
-            radar_plus=radar_plus
+            max_txt_len=max_txt_len, radar_plus=radar_plus,
+            tokenizer_path=tokenizer_path, temperature_init=temperature_init,
+            temperature_min=temperature_min, temperature_max=temperature_max,
+            attention_heads=attention_heads, attention_dropout=attention_dropout
         )
 
         model.load_checkpoint_from_config(cfg)

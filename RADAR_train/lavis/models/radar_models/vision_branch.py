@@ -20,7 +20,8 @@ class VisionBranch(nn.Module):
     )
     def __init__(
         self,
-        in_channels=1
+        in_channels=1,
+        checkpoint_path="../ckpt/checkpoint_unet.pth"
     ) -> None:
         super().__init__()
         
@@ -51,10 +52,9 @@ class VisionBranch(nn.Module):
         )
         
         # load pretrained nnu checkpoint
-        ckpt_path = '../ckpt/checkpoint_unet.pth'
-        checkpoint = torch.load(ckpt_path, map_location=torch.device('cpu'), weights_only=False)
-        network_weights = checkpoint["network_weights"]
-        msg = self.UNet.load_state_dict(network_weights, strict=False)
+        if checkpoint_path:
+            checkpoint = torch.load(checkpoint_path, map_location=torch.device("cpu"), weights_only=False)
+            self.UNet.load_state_dict(checkpoint["network_weights"], strict=False)
         
         self.proj1 = nn.Conv3d(320, 256, kernel_size=1)
         self.proj2 = nn.Conv3d(320, 256, kernel_size=1)

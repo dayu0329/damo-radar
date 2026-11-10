@@ -66,14 +66,23 @@ class RadarReportProcessor(BaseProcessor):
 @registry.register_processor("radar_image_processor")
 class RadarImageTrainProcessor(ImageBaseProcessor):
     def __init__(
-        self, image_size=384, mean=None, std=None, min_scale=0.5, max_scale=1.0
+        self,
+        image_size=384,
+        mean=None,
+        std=None,
+        min_scale=0.5,
+        max_scale=1.0,
+        flip_prob=(0.2, 0.2, 0.2),
     ):
         super().__init__(mean=mean, std=std)
+        self.flip_prob = tuple(float(value) for value in flip_prob)
+        if len(self.flip_prob) != 3 or any(value < 0 or value > 1 for value in self.flip_prob):
+            raise ValueError("preprocess.flip_prob must contain three values in [0, 1]")
 
         self.transform = transforms.Compose([
-            transforms.RandFlipd(keys=["image", "label"], prob=0.2, spatial_axis=0),
-            transforms.RandFlipd(keys=["image", "label"], prob=0.2, spatial_axis=1),
-            transforms.RandFlipd(keys=["image", "label"], prob=0.2, spatial_axis=2),
+            transforms.RandFlipd(keys=["image", "label"], prob=self.flip_prob[0], spatial_axis=0),
+            transforms.RandFlipd(keys=["image", "label"], prob=self.flip_prob[1], spatial_axis=1),
+            transforms.RandFlipd(keys=["image", "label"], prob=self.flip_prob[2], spatial_axis=2),
             transforms.ToTensord(keys=["image", "label"])
         ])
     
@@ -85,7 +94,8 @@ class RadarImageTrainProcessor(ImageBaseProcessor):
         if cfg is None:
             cfg = OmegaConf.create()
 
-        image_size = cfg.get("ifmage_size", 384)
+        image_size = cfg.get("image_size", 384)
+        flip_prob = cfg.get("flip_prob", (0.2, 0.2, 0.2))
 
         mean = cfg.get("mean", None)
         std = cfg.get("std", None)
@@ -99,4 +109,5 @@ class RadarImageTrainProcessor(ImageBaseProcessor):
             std=std,
             min_scale=min_scale,
             max_scale=max_scale,
+            flip_prob=flip_prob,
         )

@@ -7,6 +7,7 @@
 
 import re
 import os
+from pathlib import Path
 from collections import OrderedDict
 from monai import transforms
 
@@ -66,24 +67,41 @@ class __DisplMixin:
         )
 
 class CaptionDataset(BaseDataset, __DisplMixin):
-    def __init__(self, vis_processor, text_processor, vis_root, ann_paths):
-        """
-        vis_root (string): Root directory of images (e.g. coco/images/)
-        ann_root (string): directory to store the annotation file
-        """
+    def __init__(
+        self,
+        vis_processor,
+        text_processor,
+        vis_root,
+        ann_paths,
+        *,
+        data_config=None,
+        preprocess_config=None,
+    ):
         super().__init__(vis_processor, text_processor, vis_root, ann_paths)
 
-        # self.annotation = json.load(open('../ckpt/merlin_report_organ_report_v1.json'))
-        # self.organ_abnormal_info = json.load(open('../ckpt/merlin_report_organ_normal_v1.json'))
-        
-        # vis_root = '../data/merlin_data_train_demo/resized_images'    # You can use full data here, '../data/merlin_data_train_full/resized_images'. Plase merging part00-02 to one folder.
-        self.annotation = json.load(open('../ckpt/merlin_report_organ_report_v1.json'))
-        self.organ_abnormal_info = json.load(open('../ckpt/merlin_report_organ_normal_v1.json'))
-        vis_root = '/data/dataset/merlin_root/resized_images'
-        self.patient_paths = [
-            os.path.join(vis_root, folder)
-            for folder in os.listdir(vis_root)
-        ]
+        data_config = data_config or {}
+        preprocess_config = preprocess_config or {}
+        self.images_root = str(data_config.get("images", vis_root or ""))
+        self.masks_root = str(data_config.get("masks", ""))
+        reports_path = data_config.get("reports")
+        abnormal_path = data_config.get("abnormal")
+        if not reports_path or not abnormal_path:
+            raise ValueError("data.reports and data.abnormal are required")
+        self.annotation = json.loads(Path(reports_path).read_text())
+        self.organ_abnormal_info = json.loads(Path(abnormal_path).read_text())
+        self.spatial_size = tuple(int(value) for value in preprocess_config.get(
+            "spatial_size", (96, 256, 384)
+        ))
+        if len(self.spatial_size) != 3 or any(value <= 0 for value in self.spatial_size):
+            raise ValueError("preprocess.spatial_size must contain three positive integers")
+        self.intensity_clip = tuple(float(value) for value in preprocess_config.get(
+            "intensity_clip", (-1000, 1000)
+        ))
+        if len(self.intensity_clip) != 2 or self.intensity_clip[0] >= self.intensity_clip[1]:
+            raise ValueError("preprocess.intensity_clip must be [min, max]")
+        self.patient_paths = sorted(
+            str(path) for path in Path(self.images_root).glob("*.nii.gz")
+        )
 
         self.organs_cn = [
             '肾上腺', '主动脉', '竖脊肌', '脑', '锁骨', '大肠', '十二指肠', '食管', '面部', '股骨', 
@@ -140,7 +158,7 @@ class CaptionDataset(BaseDataset, __DisplMixin):
         ])
         self.pad_func = transforms.SpatialPadd(
             keys=["image", "label"],
-            spatial_size=(96, 256, 384),
+            spatial_size=self.spatial_size,
             mode='constant', 
             constant_values=0,
             method="end"
@@ -148,10 +166,16 @@ class CaptionDataset(BaseDataset, __DisplMixin):
         
         self.center_crop = transforms.CenterSpatialCropd(
             keys=["image", "label"], 
-            roi_size=(96, 256, 384)
+            roi_size=self.spatial_size
         )
 
         self.organ_ratios = {k: 1 for k in self.organs}
+
+    def mask_path_for(self, image_path):
+        image_name = Path(image_path).name
+        if self.masks_root:
+            return str(Path(self.masks_root) / image_name)
+        return image_path.replace("resized_images", "resized_masks")
 
     def __getitem__(self, index):
         exit = False
@@ -162,7 +186,7 @@ class CaptionDataset(BaseDataset, __DisplMixin):
                 img_path = patient_path
 
                 image_name = img_path.split('/')[-1].replace('.nii.gz', '')
-                mask_path = img_path.replace('resized_images', 'resized_masks')
+                mask_path = self.mask_path_for(img_path)
 
                 data = self.loader({'image': img_path, 'label': mask_path})
                 
@@ -201,8 +225,7 @@ class CaptionDataset(BaseDataset, __DisplMixin):
                 # --> online process image and mask
                 # clip, normalize to [0, 1], crop non-zero region
                 # Our default setting is [-300, 400], following merlin's setting, we used [-1000, 1000]
-                image[image>1000] = 1000
-                image[image<-1000] = -1000
+                image = image.clamp(min=self.intensity_clip[0], max=self.intensity_clip[1])
                 image = (image - image.min()) / (image.max()- image.min())
                 
                 data = {

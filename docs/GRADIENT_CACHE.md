@@ -5,8 +5,8 @@ Run from `RADAR_train` in `radar-train-nvidia-pytorch-2610`:
 ```bash
 python -m pip install -r requirements-gradcache.txt
 CUDA_VISIBLE_DEVICES=3 python validate_gradcache.py
-CUDA_VISIBLE_DEVICES=3 python -u train_gradcache.py --cfg-path radar_gradcache.yaml --max-steps 2 --verify-replay
-CUDA_VISIBLE_DEVICES=3 python -u train_gradcache.py --cfg-path radar_gradcache.yaml
+CUDA_VISIBLE_DEVICES=3 python -u train_gradcache.py --cfg-path train_gradcache.yaml --max-steps 2 --verify-replay
+CUDA_VISIBLE_DEVICES=3 python -u train_gradcache.py --cfg-path train_gradcache.yaml
 ```
 
 Use a persistent terminal such as tmux for production runs. The trainer writes
@@ -65,10 +65,10 @@ BatchNorm remains local; its buffers are not averaged across ranks.
 
 ```bash
 # Select only GPUs available for your job.
-CUDA_VISIBLE_DEVICES=3 python -u train_gradcache.py --cfg-path radar_gradcache.yaml
-CUDA_VISIBLE_DEVICES=2,3 torchrun --standalone --nproc_per_node=2 train_gradcache.py --cfg-path radar_gradcache.yaml
-CUDA_VISIBLE_DEVICES=1,2,3 torchrun --standalone --nproc_per_node=3 train_gradcache.py --cfg-path radar_gradcache.yaml
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 train_gradcache.py --cfg-path radar_gradcache.yaml
+CUDA_VISIBLE_DEVICES=3 python -u train_gradcache.py --cfg-path train_gradcache.yaml
+CUDA_VISIBLE_DEVICES=2,3 torchrun --standalone --nproc_per_node=2 train_gradcache.py --cfg-path train_gradcache.yaml
+CUDA_VISIBLE_DEVICES=1,2,3 torchrun --standalone --nproc_per_node=3 train_gradcache.py --cfg-path train_gradcache.yaml
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 train_gradcache.py --cfg-path train_gradcache.yaml
 ```
 
 Only rank zero writes shared metrics, configuration and checkpoints. Other
