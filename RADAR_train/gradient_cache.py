@@ -68,18 +68,23 @@ def gather_groups(groups):
 
 
 @torch.no_grad()
-def synchronize_gradients(model):
+def synchronize_gradients(model, trace=None):
+    trace = trace or (lambda *a, **kw: None)
     if world_size() == 1:
         return
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     used = torch.tensor([parameter.grad is not None for parameter in parameters], device="cuda", dtype=torch.int32)
+    trace("gradient_used_all_reduce.begin", parameters=len(parameters))
     distributed.all_reduce(used)
+    trace("gradient_used_all_reduce.end")
     bucket = []
     elements = 0
 
     def flush():
         flat = torch.cat([parameter.grad.reshape(-1) for parameter in bucket])
+        trace("gradient_bucket.begin", numel=flat.numel(), dtype=str(flat.dtype))
         distributed.all_reduce(flat)
+        trace("gradient_bucket.enqueued")
         offset = 0
         for parameter in bucket:
             parameter.grad.copy_(flat[offset:offset + parameter.numel()].view_as(parameter))
@@ -256,7 +261,8 @@ class GradientCache:
                 surrogate = (text.float() * gradient[chunk["start"]:chunk["end"]]).sum()
             scaler.scale(surrogate).backward()
 
-    def backward(self, samples, branch, scaler):
+    def backward(self, samples, branch, scaler, trace=None):
+        trace = trace or (lambda *a, **kw: None)
         model = self.model
         started = time.monotonic()
         visual_records = []
@@ -310,7 +316,9 @@ class GradientCache:
                                 entry["teacher"] = encode_text(model, tokens, teacher=True).float().detach()
         final_buffers = snapshot_buffers(model.visual_encoder)
         local_groups = groups
+        trace("gather_groups.begin")
         groups = gather_groups(local_groups)
+        trace("gather_groups.end")
         metrics = {"branch": branch, "cases": case_count * world_size(), "organs": {}, "effective_organs": 0}
         metrics["text_cache_batches"] = text_cache_batches
         metrics["text_token_slots"] = text_token_slots
@@ -370,14 +378,17 @@ class GradientCache:
                             torch.testing.assert_close(text.float(), entry["text"], rtol=1e-3, atol=1e-4)
                         surrogate = (text.float() * entry["text_grad"]).sum()
                     scaler.scale(surrogate).backward()
+        trace("replay_text.enqueued")
         segmentation_loss = 0.0
         logging.info("gradcache branch=%s phase=replay_visual", branch)
         try:
-            for sample, state, buffers, entries in visual_records:
+            for microbatch, (sample, state, buffers, entries) in enumerate(visual_records):
+                trace("replay_visual.begin", microbatch=microbatch, patients=list(sample["patient_id"]))
                 restore_buffers(model.visual_encoder, buffers)
                 device_sample = {"image": sample["image"].cuda()}
                 with state.replay(), self.autocast():
                     encoded, probabilities = encode_visual(model, device_sample, branch)
+                    trace("replay_visual.forward_enqueued", microbatch=microbatch)
                     target = functional.interpolate(sample["seg"].cuda().unsqueeze(1), size=probabilities.shape[-3:], mode="nearest")
                     loss_seg = self.seg_weight * model.dice_loss(probabilities.float(), target)
                     surrogate = loss_seg * (len(sample["image"]) / (case_count * world_size()))
@@ -388,14 +399,19 @@ class GradientCache:
                             torch.testing.assert_close(image.float(), entry["image"], rtol=1e-3, atol=1e-4)
                         if "image_grad" in entry:
                             surrogate = surrogate + (image.float() * entry["image_grad"]).sum()
+                trace("replay_visual.backward.begin", microbatch=microbatch)
                 scaler.scale(surrogate).backward()
+                trace("replay_visual.backward_enqueued", microbatch=microbatch)
                 del encoded, probabilities, target, surrogate, device_sample
         finally:
             restore_buffers(model.visual_encoder, final_buffers)
         if world_size() > 1:
             total_segmentation = torch.tensor(segmentation_loss, device="cuda", dtype=torch.float64)
+            trace("segmentation_all_reduce.begin")
             distributed.all_reduce(total_segmentation)
+            trace("segmentation_all_reduce.enqueued")
             segmentation_loss = total_segmentation.item()
+            trace("segmentation_all_reduce.completed")
         metrics["loss_seg"] = segmentation_loss
         metrics["loss"] = metrics["loss_itc"] + segmentation_loss
         return metrics

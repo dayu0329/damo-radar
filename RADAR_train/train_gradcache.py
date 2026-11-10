@@ -1,4 +1,5 @@
 import argparse
+import faulthandler
 from collections import defaultdict, deque
 from datetime import datetime
 import json
@@ -104,6 +105,24 @@ def main():
     if rank == 0:
         (output / "environment.json").write_text(json.dumps(environment, indent=2))
     logging.info("output=%s torch=%s cuda=%s GPU=%s", output, torch.__version__, torch.version.cuda, torch.cuda.get_device_name())
+    diagnostic_enabled = bool(config.run.get("diagnostic_logging", False))
+    if diagnostic_enabled and int(config.run.get("diagnostic_stack_timeout", 180)) < 1:
+        raise ValueError("diagnostic_stack_timeout must be >= 1")
+    diagnostic_logger = logging.getLogger("radar_diagnostic")
+    diagnostic_logger.propagate = False
+    diagnostic_logger.setLevel(logging.INFO)
+    diagnostic_logger.addHandler(logging.FileHandler(output / f"diagnostic_rank_{rank}.log") if diagnostic_enabled else logging.NullHandler())
+    stack_file = None
+    if diagnostic_enabled:
+        stack_file = (output / f"python_stack_rank_{rank}.log").open("a")
+        faulthandler.enable(file=stack_file)
+    diagnostic_context = {}
+
+    def trace(stage, **details):
+        if diagnostic_enabled:
+            diagnostic_logger.info(json.dumps({"timestamp": datetime.now().isoformat(), "rank": rank,
+                                               **diagnostic_context, "stage": stage, **details}, ensure_ascii=False))
+
     image_processor = RadarImageTrainProcessor.from_config(config.get("preprocess", {}))
     dataset = CaptionDataset(
         image_processor,
@@ -202,12 +221,18 @@ def main():
             epoch_losses = defaultdict(list)
             for update in range(updates_per_epoch):
                 started = time.monotonic()
+                diagnostic_context.update(epoch=epoch, update=update, global_step=global_step)
+                if diagnostic_enabled:
+                    faulthandler.dump_traceback_later(int(config.run.get("diagnostic_stack_timeout", 180)), repeat=True, file=stack_file)
+                trace("data_load.begin")
                 samples = [next(iterator) for _ in range(local_cases // micro_batch)]
                 # 本卡取数等待；下方 rank_wait 包含病例 ID 汇总及等待其他卡。
                 data_wait_seconds = time.monotonic() - started
                 sync_started = time.monotonic()
                 ids = sum([list(sample["patient_id"]) for sample in samples], [])
+                trace("patient_ids_all_gather.begin", patients=ids)
                 ids = sum(gather_objects(ids), [])
+                trace("patient_ids_all_gather.end")
                 if len(set(ids)) != contrastive_batch:
                     raise ValueError("A contrastive batch contains duplicate patients, possibly due to dataset retry logic")
                 rank_wait_seconds = time.monotonic() - sync_started
@@ -215,13 +240,17 @@ def main():
                 load_seconds = time.monotonic() - started
                 schedule = list(config.run.get("branch_schedule", ["global", "organ"]))
                 branch = schedule[global_step % len(schedule)] if model.radar_plus else "organ"
+                diagnostic_context["branch"] = branch
+                trace("update.begin", patients=ids)
                 rate = learning_rate(config, epoch, global_step)
                 for group in optimizer.param_groups:
                     group["lr"] = rate
                 optimizer.zero_grad(set_to_none=True)
                 torch.cuda.reset_peak_memory_stats()
-                metrics = cache.backward(samples, branch, scaler)
-                synchronize_gradients(model)
+                metrics = cache.backward(samples, branch, scaler, trace=trace)
+                trace("cache_backward.end")
+                synchronize_gradients(model, trace=trace)
+                trace("gradient_sync.enqueued")
                 scaler.unscale_(optimizer)
                 max_grad_norm = config.run.get("max_grad_norm")
                 gradient_norm = torch.nn.utils.clip_grad_norm_(
@@ -230,12 +259,17 @@ def main():
                 scale_before = scaler.get_scale()
                 if not torch.isfinite(gradient_norm) and precision != "fp16":
                     raise FloatingPointError(f"Non-finite gradients at update {global_step}")
+                trace("optimizer_step.begin")
                 scaler.step(optimizer)
                 scaler.update()
                 skipped = scaler.get_scale() < scale_before
                 skipped_updates += int(skipped)
                 optimizer.zero_grad(set_to_none=True)
+                trace("cuda_synchronize.begin")
                 torch.cuda.synchronize()
+                trace("cuda_synchronize.completed")
+                if diagnostic_enabled:
+                    faulthandler.cancel_dump_traceback_later()
                 metrics.update({
                     "world_size": world_size(), "cases_per_rank": local_cases,
                     "epoch": epoch, "update": update, "global_step": global_step,
@@ -278,6 +312,9 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except BaseException:
+        logging.exception("Training terminated: rank=%s local_rank=%s", os.environ.get("RANK", "0"), os.environ.get("LOCAL_RANK", "0"))
+        raise
     finally:
         if distributed.is_initialized():
             distributed.destroy_process_group()

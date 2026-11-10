@@ -114,6 +114,12 @@ run:
 
   # 日志和指标窗口设置。
   log_freq: 1
+  # 每个 rank 独立记录阶段、病例 ID、视觉小批次和梯度通信，不向终端刷屏。
+  # 输出 diagnostic_rank_*.log；enqueued 仅表示调用返回，不代表 GPU 完成。
+  diagnostic_logging: true
+  # 关联 diagnostic_logging：单步超过此秒数，重复写各线程堆栈到 python_stack_rank_*.log。
+  # 每次更新重新计时，不终止训练、不延长 NCCL 超时；诊断结束可关闭上面的开关。
+  diagnostic_stack_timeout: 180
   metrics_window: 100
 
   # 输出目录由根目录和全局对比 batch 大小派生。
