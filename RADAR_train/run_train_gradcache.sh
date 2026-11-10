@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+
+# 减少变长张量分配产生的显存碎片；不增加容量，新启动的训练进程生效。
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 set -euo pipefail
 
 cd "$(dirname "$0")"
